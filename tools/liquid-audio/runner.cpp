@@ -485,7 +485,7 @@ class Runner::RunnerImpl {
                     text_done = true;
                 }
 
-                if (modality_left == 0 or text_done) {
+                if (modality_left == 0 || text_done) {
                     modality_left    = interleaved_n_audio;
                     current_modality = Modality::AUDIO_OUT;
                 }
@@ -498,7 +498,7 @@ class Runner::RunnerImpl {
                 }
 
                 modality_left -= 1;
-                if (modality_left == 0 and not text_done) {
+                if (modality_left == 0 && !text_done) {
                     current_modality = Modality::TEXT;
                     modality_left    = interleaved_n_text;
                 }

@@ -133,7 +133,7 @@ int main(int argc, char ** argv) {
     LOG("\n");
 
     // write output
-    if (not generated_audio.empty()) {
+    if (!generated_audio.empty()) {
         if (params.out_file.empty()) {
             LOG_ERR("ERR: --output is required for audio generation\n");
             return 1;
@@ -144,7 +144,7 @@ int main(int argc, char ** argv) {
         LOG("=== GENERATED AUDIO ===\nSaved to %s\n\n", params.out_file.c_str());
     }
 
-    if (not generated_text.empty()) {
+    if (!generated_text.empty()) {
         LOG("=== GENERATED TEXT ===\n%s\n\n", generated_text.c_str());
     }
 
