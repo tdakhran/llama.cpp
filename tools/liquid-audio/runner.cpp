@@ -5,7 +5,6 @@
 //
 #include "chat.h"
 #include "common.h"
-#include "decoder.h"
 #include "llama.h"
 #include "log.h"
 #include "mtmd-helper.h"
@@ -34,25 +33,12 @@ struct audio_context {
     common_sampler *    smpl;
     llama_pos           n_past = 0;
 
-    // audio tokenizer
-    common_init_result_ptr audio_tokenizer_llama_init;
-    llama_model *          audio_tokenizer_model;
-    llama_context *        audio_tokenizer_lctx;
-
     int n_batch;
     int verbosity = 0;
 
     mtmd::bitmaps bitmaps;
 
     common_chat_templates_ptr tmpls;
-
-    // audio sampling params
-    float audio_temperature = 0.0f;
-    int   audio_top_k       = 1;
-
-    // threadpool
-    ggml_threadpool * threadpool                  = nullptr;
-    void (*threadpool_free_fn)(ggml_threadpool *) = nullptr;
 
     int init(common_params & params) {
         // backbone
@@ -62,20 +48,6 @@ struct audio_context {
 
         if (!model || !lctx) {
             LOG_ERR("Failed to load backbone\n");
-            return 1;
-        }
-
-        // audio tokenizer
-        auto params_audio_tokenizer        = params;
-        params_audio_tokenizer.model.path  = params.vocoder.speaker_file;
-        params_audio_tokenizer.mmproj.path = "";
-        params_audio_tokenizer.embedding   = true;
-        audio_tokenizer_llama_init         = common_init_from_params(params_audio_tokenizer);
-        audio_tokenizer_model              = audio_tokenizer_llama_init->model();
-        audio_tokenizer_lctx               = audio_tokenizer_llama_init->context();
-
-        if (!audio_tokenizer_model || !audio_tokenizer_lctx) {
-            LOG_ERR("Failed to load audio tokenizer\n");
             return 1;
         }
 
@@ -99,6 +71,16 @@ struct audio_context {
         mparams.use_gpu               = params.mmproj_use_gpu;
         mparams.print_timings         = true;
         mparams.n_threads             = params.cpuparams.n_threads;
+        const bool has_vocoder    = !params.vocoder.model.path.empty();
+        const bool has_detokenizer = !params.vocoder.speaker_file.empty();
+        const bool enable_audio_output = has_vocoder && has_detokenizer;
+        if (enable_audio_output) {
+            mparams.vocoder_path   = params.vocoder.model.path.c_str();
+            mparams.tokenizer_path = params.vocoder.speaker_file.c_str();
+        } else if (has_vocoder || has_detokenizer) {
+            LOG_WRN("%s: audio output disabled: both -mv (vocoder) and --tts-speaker-file (audio detokenizer) are required\n",
+                    __func__);
+        }
         mtmd_ctx_audio.reset(mtmd_init_from_file(clip_path, model, mparams));
         if (!mtmd_ctx_audio.get()) {
             LOG_ERR("Failed to load audio model from %s\n", clip_path);
@@ -117,38 +99,32 @@ class Runner::RunnerImpl {
   public:
     RunnerImpl() = default;
 
-    int generate(const std::vector<Message> & messages,
-                 int                          n_predict,
-                 const text_callback_t &      text_callback,
-                 const audio_callback_t &     audio_callback) {
+    int generate(const std::vector<Message> &              messages,
+                 int                                       n_predict,
+                 const text_callback_t &                   text_callback,
+                 const audio_callback_t &                  audio_callback,
+                 const std::vector<mtmd_output_modality> & modalities) {
+        const bool audio_output_supported = mtmd_support_audio_output(ctx.mtmd_ctx_audio.get());
+        if (audio_output_supported) {
+            mtmd_set_output_modalities(ctx.mtmd_ctx_audio.get(), modalities.data(), modalities.size());
+            mtmd_audio_output_start_new_turn(ctx.mtmd_ctx_audio.get());
+        } else {
+            bool requested_audio = false;
+            for (const auto modality : modalities) {
+                if (modality == MTMD_OUTPUT_MODALITY_AUDIO) {
+                    requested_audio = true;
+                    break;
+                }
+            }
+            if (requested_audio) {
+                LOG_WRN("%s: requested audio output, but vocoder/audio detokenizer are not available; falling back to text-only output\n",
+                        __func__);
+            }
+        }
+
         std::vector<common_chat_msg> msgs;
         for (const auto & message : messages) {
-            if (const auto & role = message.role; role == "system") {
-                if (const auto & system_prompt = message.content; system_prompt == asr_system_prompt) {
-                    generator = &Runner::RunnerImpl::generate_sequential;
-                } else if (system_prompt == interleaved_system_prompt) {
-                    // TODO(tarek): check params with Marc
-                    ctx.audio_temperature = 0.8;
-                    ctx.audio_top_k       = 4;
-                    generator             = &Runner::RunnerImpl::generate_interleaved;
-                } else if (std::find(begin(tts_system_prompts), end(tts_system_prompts), system_prompt) !=
-                           end(tts_system_prompts)) {
-                    // TODO(tarek): check params with Marc
-                    ctx.audio_temperature = 0.8;
-                    ctx.audio_top_k       = 64;
-                    generator             = &Runner::RunnerImpl::generate_sequential;
-                } else {
-                    std::vector<std::string> prompts = tts_system_prompts;
-                    prompts.push_back(asr_system_prompt);
-                    prompts.push_back(interleaved_system_prompt);
-                    std::string err;
-                    for (const auto & p : prompts) {
-                        err += " - " + p + "\n";
-                    }
-
-                    return error("Unsupported system prompt. Supported prompts are:\n" + err);
-                }
-            } else if (role == "user") {
+            if (message.role == "user") {
                 if (const auto & wav = message.wav; !wav.empty()) {
                     if (message.content != mtmd_default_marker()) {
                         return error("when providing audio input, content must be the default marker: " +
@@ -189,7 +165,7 @@ class Runner::RunnerImpl {
             audio_callback(audio);
         };
 
-        if (!stop_requested && (this->*generator)(n_predict, text_callback_perf, audio_callback_perf) != 0) {
+        if (!stop_requested && generate_common(n_predict, text_callback_perf, audio_callback_perf) != 0) {
             return error("failed to generate");
         }
 
@@ -202,7 +178,6 @@ class Runner::RunnerImpl {
         for (const auto & [p, desc] : {
                  std::pair{ params.model.path,         "-m"       },
                  std::pair{ params.mmproj.path,        "--mmproj" },
-                 std::pair{ params.vocoder.model.path, "-mv"      },
         }) {
             if (p.empty()) {
                 LOG_ERR("ERR: Missing %s argument\n", desc);
@@ -218,23 +193,10 @@ class Runner::RunnerImpl {
             return error("failed to initialize audio context");
         }
 
-        // audio decoder
-        decoder = std::make_unique<Decoder>(params);
-        if (!decoder) {
-            return error("failed to initialize audio decoder");
-        }
-
-        init_threadpool(params.cpuparams.n_threads);
-
-        istft_state = std::make_unique<mtmd_audio_streaming_istft>(istft_config.n_fft, istft_config.hop_length);
-        GGML_ASSERT(istft_state);
-
         reset();
 
         return 0;
     }
-
-    int get_output_sample_rate() const { return istft_config.sample_rate; }
 
     void perf_context_print() const {
         llama_perf_context_print(ctx.lctx);
@@ -260,34 +222,16 @@ class Runner::RunnerImpl {
 
         llama_memory_clear(llama_get_memory(ctx.lctx), false);
         ctx.n_past = 0;
-
-        llama_memory_clear(llama_get_memory(ctx.audio_tokenizer_lctx), false);
-        istft_state->reset();
     }
 
-    ~RunnerImpl() {
-        if (threadpool && threadpool_free_fn) {
-            threadpool_free_fn(threadpool);
+    int get_output_sample_rate() const {
+        if (!mtmd_support_audio_output(ctx.mtmd_ctx_audio.get())) {
+            return 0;
         }
+        return mtmd_audio_output_get_sample_rate(ctx.mtmd_ctx_audio.get());
     }
-
 
   private:
-    struct {
-        int n_fft       = 1280;
-        int hop_length  = 320;
-        int sample_rate = 24000;
-        int n_codes     = 8;
-    } istft_config;
-
-    enum class Modality : uint8_t {
-        TEXT,
-        AUDIO_OUT,
-
-    };
-
-    using audio_token_t = std::array<int32_t, 8>;
-
     audio_context ctx;
 
     std::atomic<bool> stop_requested = false;
@@ -298,49 +242,14 @@ class Runner::RunnerImpl {
     std::optional<int64_t> first_text_received, first_audio_received;
     std::optional<int64_t> last_text_received, last_audio_received;
 
-    std::unique_ptr<Decoder> decoder;
-    int (Runner::RunnerImpl::*generator)(int, const text_callback_t &, const audio_callback_t &) = nullptr;
-
-    // threadpool
-    ggml_threadpool * threadpool                  = nullptr;
-    void (*threadpool_free_fn)(ggml_threadpool *) = nullptr;
-
-    std::unique_ptr<mtmd_audio_streaming_istft> istft_state;
-
-    void init_threadpool(int n_threads) {
-        auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-        GGML_ASSERT(cpu_dev);
-        auto * reg = ggml_backend_dev_backend_reg(cpu_dev);
-        GGML_ASSERT(reg);
-        GGML_ASSERT(n_threads > 0);
-        if (auto * threadpool_new_fn = (ggml_threadpool * (*) (ggml_threadpool_params *) )
-                ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_new");
-            threadpool_new_fn) {
-            ggml_threadpool_params tpp = ggml_threadpool_params_default(n_threads);
-            threadpool                 = threadpool_new_fn(&tpp);
-        }
-        threadpool_free_fn =
-            (decltype(threadpool_free_fn)) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_free");
-        GGML_ASSERT(threadpool);
-
-        llama_attach_threadpool(ctx.lctx, threadpool, nullptr);
-        llama_attach_threadpool(ctx.audio_tokenizer_lctx, threadpool, nullptr);
-        decoder->set_threadpool(threadpool, n_threads);
-    }
-
     int error(const std::string & msg) {
         LOG_ERR("ERR: %s\n", msg.c_str());
         last_error_ = msg;
         return 1;
     }
 
-    int generate_common(int                                                              n_predict,
-                        const std::function<Modality(const llama_token &, Modality)> &   text_handler,
-                        const std::function<Modality(const audio_token_t &, Modality)> & audio_handler,
-                        const text_callback_t &                                          text_callback,
-                        const audio_callback_t &                                         audio_callback) {
-        Modality    current_modality = Modality::TEXT;
-        llama_batch batch            = llama_batch_get_one(nullptr, 1);  // doesn't own pointers, no need for free.
+    int generate_common(int n_predict, const text_callback_t & text_callback, const audio_callback_t & audio_callback) {
+        llama_batch batch = llama_batch_get_one(nullptr, 1);  // doesn't own pointers, no need for free.
 
         n_predict = n_predict < 0 ? std::numeric_limits<int>::max() : n_predict;
         std::vector<float> embd(llama_model_n_embd(ctx.model));
@@ -358,10 +267,10 @@ class Runner::RunnerImpl {
                 ctx.n_past += batch.n_tokens;
             }
 
-            auto previous_modality = current_modality;  // track change of modality
-            if (current_modality == Modality::TEXT) {
-                llama_token next_text_token = 0;
-                next_text_token             = common_sampler_sample(ctx.smpl, ctx.lctx, -1);
+            auto * mctx = ctx.mtmd_ctx_audio.get();
+
+            if (mtmd_get_output_modality(mctx) == MTMD_OUTPUT_MODALITY_TEXT) {
+                llama_token next_text_token = common_sampler_sample(ctx.smpl, ctx.lctx, -1);
                 common_sampler_accept(ctx.smpl, next_text_token, true);
 
                 if (llama_vocab_is_eog(ctx.vocab, next_text_token)) {
@@ -369,46 +278,31 @@ class Runner::RunnerImpl {
                     break;  // end of generation
                 }
 
-                current_modality = text_handler(next_text_token, current_modality);
-
-                if (next_text_token != 130 && next_text_token != 128) {  // text_end, audio_start
-                    auto token_str = common_token_to_piece(ctx.lctx, next_text_token);
+                // output
+                if (auto token_str = common_token_to_piece(ctx.lctx, next_text_token, false); !token_str.empty()) {
                     text_callback(token_str);
                     LOG("%s", token_str.c_str());
                     fflush(stdout);
                 }
 
+                mtmd_audio_output_accept_token(mctx, next_text_token);
+
                 batch.token = &next_text_token;
                 batch.embd  = nullptr;
-            } else if (current_modality == Modality::AUDIO_OUT) {
-                std::memcpy(embd.data(), llama_get_embeddings(ctx.lctx), sizeof(float) * embd.size());
+            } else if (mtmd_get_output_modality(mctx) == MTMD_OUTPUT_MODALITY_AUDIO) {
+                int res = mtmd_audio_output_decode(mctx, llama_get_embeddings(ctx.lctx), llama_model_n_embd(ctx.model),
+                                                   embd.data());
+                GGML_ASSERT(res == 0);
+                auto                 n_samples = mtmd_get_n_audio_samples(mctx);
+                std::vector<int16_t> samples(n_samples);
+                mtmd_get_audio_samples(mctx, samples.data());
+                audio_callback(samples);
 
-                GGML_ASSERT(decoder);
-
-                auto          t0         = ggml_time_ms();
-                audio_token_t next_token = decoder->sample_audio_frame(embd, ctx.audio_temperature, ctx.audio_top_k);
-                if (ctx.verbosity) {
-                    LOG_INF("audio frame sampled in %" PRId64 " ms\n", ggml_time_ms() - t0);
-                }
-
-                current_modality = audio_handler(next_token, current_modality);
-
-                if (next_token[0] == 2048) {
-                    current_modality = Modality::TEXT;
-                    std::fill(next_token.begin(), next_token.end(), 2048);
-                } else {
-                    auto decoded = detokenize(next_token);
-                    audio_callback(decoded);
-                }
-
-                embd        = decoder->embed(next_token);
                 batch.embd  = embd.data();
                 batch.token = nullptr;
             }
 
-            if (previous_modality != current_modality) {
-                llama_set_embeddings(ctx.lctx, current_modality == Modality::AUDIO_OUT);
-            }
+            llama_set_embeddings(ctx.lctx, mtmd_get_output_modality(mctx) == MTMD_OUTPUT_MODALITY_AUDIO);
 
             if (stop_requested) {
                 LOG("\n");
@@ -418,113 +312,6 @@ class Runner::RunnerImpl {
         LOG("\n");
 
         return 0;
-    }
-
-    std::vector<float> detokenize(const audio_token_t & codes) const {
-        // embed_for_detokenizer, converts 8 audio codes into 6 embeddings for lfm2
-        int  n_tokens = 6;
-        auto embd     = decoder->embed_for_detokenizer(codes);
-
-        const int   n_out = llama_model_n_embd_out(ctx.audio_tokenizer_model);
-        llama_batch batch = llama_batch_get_one(nullptr, n_tokens);
-
-        batch.embd = embd.data();
-
-        if (llama_decode(ctx.audio_tokenizer_lctx, batch)) {
-            LOG_ERR("failed to run audio tokenizer\n");
-            exit(1);
-        }
-
-        std::vector<float> output(n_tokens * n_out);
-        std::memcpy(output.data(), llama_get_embeddings(ctx.audio_tokenizer_lctx), sizeof(float) * output.size());
-
-        return istft(output);
-    }
-
-    std::vector<float> istft(const std::vector<float> & embd) const {
-        const int n_fft_bins    = istft_config.n_fft / 2 + 1;
-        int       n_frames      = embd.size() / (n_fft_bins * 2);
-        int       output_length = (n_frames - 1) * istft_config.hop_length;
-
-        std::vector<float> output;
-        output.reserve(output_length);
-
-        // Perform ISTFT - process each frame
-        for (int i = 0; i < n_frames; i++) {
-            std::vector<float> frame_spectrum(n_fft_bins * 2);
-
-            // Extract frame spectrum from embd (which is in [n_fft_bins × n_frames × 2] format)
-            for (int j = 0; j < n_fft_bins; j++) {
-                const auto log_abs        = embd[i * n_fft_bins * 2 + 0 * n_fft_bins + j];
-                const auto angle          = embd[i * n_fft_bins * 2 + 1 * n_fft_bins + j];
-                const auto p              = std::polar(expf(log_abs), angle);
-                frame_spectrum[j * 2 + 0] = p.real();
-                frame_spectrum[j * 2 + 1] = p.imag();
-            }
-
-            auto frame_output = istft_state->process_frame(frame_spectrum.data());
-            output.insert(output.end(), frame_output.begin(), frame_output.end());
-        }
-
-        return output;
-    }
-
-    int generate_interleaved(int                      n_predict,
-                             const text_callback_t &  text_callback,
-                             const audio_callback_t & audio_callback) {
-        constexpr auto interleaved_n_text  = 6;
-        constexpr auto interleaved_n_audio = 12;
-        int            modality_left       = interleaved_n_text;
-        bool           text_done           = false;
-
-        return generate_common(
-            n_predict,
-            [&](const llama_token & next_text_token, Modality current_modality) {
-                modality_left -= 1;
-                if (next_text_token == 130) {  // <|text_end|>
-                    text_done = true;
-                }
-
-                if (modality_left == 0 || text_done) {
-                    modality_left    = interleaved_n_audio;
-                    current_modality = Modality::AUDIO_OUT;
-                }
-
-                return current_modality;
-            },
-            [&](const audio_token_t & next_token, Modality current_modality) {
-                if (ctx.verbosity) {
-                    log_audio_tokens(next_token);
-                }
-
-                modality_left -= 1;
-                if (modality_left == 0 && !text_done) {
-                    current_modality = Modality::TEXT;
-                    modality_left    = interleaved_n_text;
-                }
-                return current_modality;
-            },
-            text_callback, audio_callback);
-    }
-
-    int generate_sequential(int                      n_predict,
-                            const text_callback_t &  text_callback,
-                            const audio_callback_t & audio_callback) {
-        return generate_common(
-            n_predict,
-            [&](const llama_token & next_text_token, Modality current_modality) {
-                if (next_text_token == 128) {  // <|audio_start|>
-                    current_modality = Modality::AUDIO_OUT;
-                }
-                return current_modality;
-            },
-            [&](const audio_token_t & next_token, Modality current_modality) {
-                if (ctx.verbosity) {
-                    log_audio_tokens(next_token);
-                }
-                return current_modality;
-            },
-            text_callback, audio_callback);
     }
 
     void perf_context_reset() {
@@ -584,21 +371,6 @@ class Runner::RunnerImpl {
 
         return 0;
     }
-
-    static void log_audio_tokens(const audio_token_t & next_token) {
-        LOG_INF("audio tokens: ");
-        bool first = true;
-        for (auto t : next_token) {
-            if (first) {
-                first = false;
-            } else {
-                LOG(", ");
-            }
-            LOG("%d", t);
-        }
-        LOG("\n");
-        fflush(stdout);
-    }
 };
 
 // forward to impl_
@@ -618,11 +390,12 @@ void Runner::stop() {
     impl_->stop();
 }
 
-int Runner::generate(const std::vector<Message> & messages,
-                     int                          n_predict,
-                     const text_callback_t &      text_callback,
-                     const audio_callback_t &     audio_callback) {
-    return impl_->generate(messages, n_predict, text_callback, audio_callback);
+int Runner::generate(const std::vector<Message> &              messages,
+                     int                                       n_predict,
+                     const text_callback_t &                   text_callback,
+                     const audio_callback_t &                  audio_callback,
+                     const std::vector<mtmd_output_modality> & modalities) {
+    return impl_->generate(messages, n_predict, text_callback, audio_callback, modalities);
 }
 
 int Runner::init(common_params params) {

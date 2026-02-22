@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.h"
+#include "mtmd.h"
 
 #include <functional>
 #include <string>
@@ -8,9 +9,9 @@
 namespace liquid {
 namespace audio {
 
-using generated_audio_t = std::vector<float>;
+using generated_audio_t = std::vector<int16_t>;
 using text_callback_t   = std::function<void(const std::string &)>;
-using audio_callback_t  = std::function<void(const std::vector<float> &)>;
+using audio_callback_t  = std::function<void(const std::vector<int16_t> &)>;
 
 class Runner {
   public:
@@ -37,10 +38,11 @@ class Runner {
 
     int  init(common_params params);
     void stop();
-    int  generate(const std::vector<Message> & messages,
-                  int                          n_predict,
-                  const text_callback_t &      text_callback,
-                  const audio_callback_t &     audio_callback);
+    int  generate(const std::vector<Message> &              messages,
+                  int                                       n_predict,
+                  const text_callback_t &                   text_callback,
+                  const audio_callback_t &                  audio_callback,
+                  const std::vector<mtmd_output_modality> & modalities);
 
     int          get_output_sample_rate() const;
     const char * get_last_error() const;

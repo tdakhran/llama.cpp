@@ -1,8 +1,19 @@
+#!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "numpy",
+#     "soundfile",
+#     "openai",
+# ]
+# ///
+"""Example script for LFM2.5-Audio server with OpenAI-compatible API."""
+
 import argparse
 import base64
-import struct
 import time
 
+import numpy as np
 import soundfile as sf
 from openai import OpenAI
 
@@ -32,6 +43,7 @@ def interleaved(client, text=None, wav_data=None):
 
     return client.chat.completions.create(
         model="",
+        modalities=["text", "audio"],
         messages=messages,
         stream=True,
         max_tokens=512,
@@ -41,8 +53,9 @@ def interleaved(client, text=None, wav_data=None):
 def tts(client, text):
     return client.chat.completions.create(
         model="",
+        modalities=["audio"],
         messages=[
-            {"role": "system", "content": "Perform TTS."},
+            {"role": "system", "content": "Perform TTS. Use the US male voice."},
             {"role": "user", "content": text},
         ],
         stream=True,
@@ -54,6 +67,7 @@ def asr(client, wav_data):
     encoded_wav_data = base64.b64encode(wav_data).decode("utf-8")
     return client.chat.completions.create(
         model="",
+        modalities=["text"],
         messages=[
             {"role": "system", "content": "Perform ASR."},
             {
@@ -76,6 +90,7 @@ def collect_output(stream):
     received_text = []
     received_audio = []
     completed = False
+    audio_sample_rate = None
 
     for chunk in stream:
         # Check for proper completion
@@ -90,11 +105,14 @@ def collect_output(stream):
             received_text.append((time.time(), text))
             print(text, end="", flush=True)
 
-        # Handle audio chunks
-        if hasattr(delta, "audio_chunk") and delta.audio_chunk:
-            chunk_data = delta.audio_chunk["data"]
+        # Handle audio chunks (OpenAI-compatible format: delta.audio.data)
+        if hasattr(delta, "audio") and delta.audio and "data" in delta.audio:
+            # Get sample rate from response if available
+            if audio_sample_rate is None and "sample_rate" in delta.audio:
+                audio_sample_rate = delta.audio["sample_rate"]
+            chunk_data = delta.audio["data"]
             pcm_bytes = base64.b64decode(chunk_data)
-            samples = struct.unpack(f"<{len(pcm_bytes) // 4}f", pcm_bytes)
+            samples = np.frombuffer(pcm_bytes, dtype=np.int16)
             received_audio.append((time.time(), samples))
 
     if not completed:
@@ -107,7 +125,7 @@ def collect_output(stream):
     print(
         f"TTFT :                        {min(x[0][0] for x in [received_text, received_audio] if x) - t0:>5.3f}         s"
     )
-    if text:
+    if text and len(received_text) > 1:
         print(
             f"Text : {len(received_text):>8}  tokens at {len(received_text) / (received_text[-1][0] - received_text[0][0]):>8.0f}  tokens/s"
         )
@@ -116,7 +134,7 @@ def collect_output(stream):
             f"Audio: {len(audio):>8} samples at {len(audio) / (received_audio[-1][0] - received_audio[0][0]):>8.0f} samples/s"
         )
 
-    return text if text else None, audio if audio else None
+    return text if text else None, audio if audio else None, audio_sample_rate
 
 
 def make_request(base_url, mode, wav_file, text, output):
@@ -142,14 +160,13 @@ def make_request(base_url, mode, wav_file, text, output):
         stream = interleaved(client, text=text, wav_data=wav_data)
 
     # Collect output
-    text, audio_samples = collect_output(stream)
+    text, audio_samples, audio_sample_rate = collect_output(stream)
 
     # Display results
     if audio_samples:
         print(f"\nReceived {len(audio_samples)} audio samples")
-        sample_rate = 24000
-        sf.write(output, audio_samples, sample_rate)
-        print(f"Saved audio to {output}")
+        sf.write(output, audio_samples, audio_sample_rate)
+        print(f"Saved audio to {output} (sample rate: {audio_sample_rate})")
 
     if text:
         print(f"\nTranscribed/Generated text: {text}")

@@ -95,6 +95,15 @@ struct mtmd_context_params {
     // limit number of image tokens, only for vision models with dynamic resolution
     int image_min_tokens; // minimum number of tokens for image input (default: read from metadata)
     int image_max_tokens; // maximum number of tokens for image input (default: read from metadata)
+
+    // callback function passed over to mtmd proper
+    ggml_backend_sched_eval_callback cb_eval;
+    void * cb_eval_user_data;
+
+    // audio output parameters (for TTS models like LFM2.5-Audio)
+    const char * vocoder_path;      // path to vocoder model (enables audio output if set)
+    const char * tokenizer_path;    // path to audio tokenizer model (for LFM2.5)
+
 };
 
 MTMD_API const char * mtmd_default_marker(void);
@@ -232,6 +241,45 @@ MTMD_API void mtmd_log_set(ggml_log_callback log_callback, void * user_data);
 // test function, to be used in test-mtmd-c-api.c
 MTMD_API mtmd_input_chunks * mtmd_test_create_input_chunks(void);
 
+//
+// Audio output API
+//
+enum mtmd_output_modality {
+    MTMD_OUTPUT_MODALITY_TEXT,
+    MTMD_OUTPUT_MODALITY_AUDIO,
+    MTMD_OUTPUT_MODALITY_END,
+};
+
+// check if audio output is supported
+MTMD_API bool mtmd_support_audio_output(mtmd_context * ctx);
+
+// returns 0 if audio output is not supported
+MTMD_API int mtmd_audio_output_get_sample_rate(mtmd_context * ctx);
+
+// decode audio frame
+MTMD_API int mtmd_audio_output_decode(mtmd_context * ctx,
+                                      const float *  embedding,
+                                      size_t         n_embd,
+                                      float *        out_embedding);
+
+// get current output modality
+MTMD_API mtmd_output_modality mtmd_get_output_modality(mtmd_context * ctx);
+
+// get num of audio samples available after last decode
+MTMD_API int mtmd_get_n_audio_samples(mtmd_context * ctx);
+
+// retrieve audio samples after last decode
+MTMD_API int mtmd_get_audio_samples(mtmd_context * ctx, int16_t * samples);
+
+// accept text token, can switch modality
+MTMD_API void mtmd_audio_output_accept_token(mtmd_context * ctx, llama_token id);
+
+// set output modalities sequence for generation
+MTMD_API void mtmd_set_output_modalities(mtmd_context * ctx, const mtmd_output_modality * ptr, size_t len);
+
+// notify about new turn start, has to be called after modalities are set
+MTMD_API void mtmd_audio_output_start_new_turn(mtmd_context * ctx);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif
@@ -273,12 +321,12 @@ struct bitmap {
         ptr.reset(mtmd_bitmap_init(nx, ny, data));
     }
     ~bitmap() = default;
-    uint32_t nx() { return mtmd_bitmap_get_nx(ptr.get()); }
-    uint32_t ny() { return mtmd_bitmap_get_ny(ptr.get()); }
-    const unsigned char * data() { return mtmd_bitmap_get_data(ptr.get()); }
-    size_t n_bytes() { return mtmd_bitmap_get_n_bytes(ptr.get()); }
-    std::string id() { return mtmd_bitmap_get_id(ptr.get()); }
-    void set_id(const char * id) { mtmd_bitmap_set_id(ptr.get(), id); }
+    uint32_t nx() const { return mtmd_bitmap_get_nx(ptr.get()); }
+    uint32_t ny() const { return mtmd_bitmap_get_ny(ptr.get()); }
+    const unsigned char * data() const { return mtmd_bitmap_get_data(ptr.get()); }
+    size_t n_bytes() const { return mtmd_bitmap_get_n_bytes(ptr.get()); }
+    std::string id() const { return mtmd_bitmap_get_id(ptr.get()); }
+    void set_id(const char * id) const { mtmd_bitmap_set_id(ptr.get(), id); }
 };
 
 struct bitmaps {
@@ -302,8 +350,8 @@ struct input_chunks {
     input_chunks() = default;
     input_chunks(mtmd_input_chunks * chunks) : ptr(chunks) {}
     ~input_chunks() = default;
-    size_t size() { return mtmd_input_chunks_size(ptr.get()); }
-    const mtmd_input_chunk * operator[](size_t idx) {
+    size_t size() const { return mtmd_input_chunks_size(ptr.get()); }
+    const mtmd_input_chunk * operator[](size_t idx) const {
         return mtmd_input_chunks_get(ptr.get(), idx);
     }
 };

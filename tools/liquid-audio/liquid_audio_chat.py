@@ -36,6 +36,7 @@ from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 import os
 import contextlib
 
+
 @contextlib.contextmanager
 def suppress_stderr():
     """Temporarily redirect stderr to /dev/null."""
@@ -53,7 +54,7 @@ def suppress_stderr():
 class AudioPlayer:
     """Streams audio samples to speakers via PyAudio (non-blocking)."""
 
-    def __init__(self, sample_rate=24000):
+    def __init__(self, sample_rate=None):
         self.sample_rate = sample_rate
         self.all_samples = []
         self.pyaudio = None
@@ -61,6 +62,7 @@ class AudioPlayer:
         self.queue = Queue()
         self.thread = None
         self.running = False
+        self.started = False
 
     def _playback_thread(self):
         """Background thread that writes audio to the stream."""
@@ -73,24 +75,34 @@ class AudioPlayer:
                 pass
 
     def start(self):
-        """Start the audio stream."""
+        """Prepare the audio player (stream starts on first samples)."""
         self.all_samples = []
         self.running = True
+        self.started = False
+
+    def _start_stream(self):
+        """Actually start the audio stream (called when sample rate is known)."""
+        if self.started or self.sample_rate is None:
+            return
         with suppress_stderr():
             self.pyaudio = pyaudio.PyAudio()
             self.stream = self.pyaudio.open(
-                format=pyaudio.paFloat32,
+                format=pyaudio.paInt16,
                 channels=1,
                 rate=self.sample_rate,
                 output=True,
             )
         self.thread = threading.Thread(target=self._playback_thread, daemon=True)
         self.thread.start()
+        self.started = True
 
-    def add_samples(self, samples):
+    def add_samples(self, samples, sample_rate=None):
         """Add samples to playback queue (non-blocking)."""
+        if sample_rate is not None and self.sample_rate is None:
+            self.sample_rate = sample_rate
+        self._start_stream()
         self.all_samples.extend(samples)
-        pcm_data = np.array(samples, dtype=np.float32).tobytes()
+        pcm_data = np.array(samples, dtype=np.int16).tobytes()
         self.queue.put(pcm_data)
 
     def stop(self, output_file="output.wav"):
@@ -217,17 +229,20 @@ def create_stream_single_shot(client, mode, text=None, wav_data=None, max_tokens
     """Create a single-shot request for ASR/TTS (always resets context)."""
     messages = [{"role": "system", "content": SYSTEM_PROMPTS[mode]}]
 
+    modalities = []
     if mode == "asr" and wav_data:
         messages.append(create_audio_message(wav_data))
+        modalities.append("text")
     elif mode == "tts" and text:
         messages.append(create_text_message(text))
+        modalities.append("audio")
 
     return client.chat.completions.create(
         model="",
+        modalities=modalities,
         messages=messages,
         stream=True,
         max_tokens=max_tokens,
-        extra_body={"reset_context": True},
     )
 
 
@@ -235,10 +250,15 @@ def create_stream_chat(client, messages, max_tokens=512, reset_context=False):
     """Create a chat request for interleaved mode (maintains context)."""
     return client.chat.completions.create(
         model="",
+        modalities=["text", "audio"],
         messages=messages,
         stream=True,
         max_tokens=max_tokens,
-        extra_body={"reset_context": reset_context},
+        extra_body={
+            "id_slot": 0,
+            "continue": not reset_context,
+            "reset_context": reset_context,
+        },
     )
 
 
@@ -250,6 +270,7 @@ def process_stream(stream, audio_player=None):
     audio_chunks = []
     total_samples = 0
     completed = False
+    audio_sample_rate = None
 
     for chunk in stream:
         if chunk.choices[0].finish_reason == "stop":
@@ -266,12 +287,15 @@ def process_stream(stream, audio_player=None):
             print(text, end="", flush=True)
 
         # Handle audio
-        if hasattr(delta, "audio_chunk") and delta.audio_chunk:
+        if hasattr(delta, "audio") and delta.audio and "data" in delta.audio:
             if ttft is None:
                 ttft = time.time() - t0
-            chunk_data = delta.audio_chunk["data"]
+            # Get sample rate from response if available
+            if audio_sample_rate is None and "sample_rate" in delta.audio:
+                audio_sample_rate = delta.audio["sample_rate"]
+            chunk_data = delta.audio["data"]
             pcm_bytes = base64.b64decode(chunk_data)
-            samples = struct.unpack(f"<{len(pcm_bytes) // 4}f", pcm_bytes)
+            samples = np.frombuffer(pcm_bytes, dtype=np.int16)
             audio_chunks.append((time.time(), samples))
             total_samples += len(samples)
 
@@ -279,7 +303,7 @@ def process_stream(stream, audio_player=None):
             print("♪", end="", flush=True)
 
             if audio_player:
-                audio_player.add_samples(samples)
+                audio_player.add_samples(samples, sample_rate=audio_sample_rate)
 
     if text_chunks or audio_chunks:
         print()  # Newline after output
@@ -298,15 +322,19 @@ def process_stream(stream, audio_player=None):
     if text_chunks and len(text_chunks) > 1:
         text_duration = text_chunks[-1][0] - text_chunks[0][0]
         if text_duration > 0:
-            stats.append(f"text {len(text_chunks)} tok @ {len(text_chunks)/text_duration:.1f} tok/s")
+            stats.append(
+                f"text {len(text_chunks)} tok @ {len(text_chunks) / text_duration:.1f} tok/s"
+            )
 
     if audio_chunks:
         # Calculate from ttft to last chunk for accurate throughput
         first_audio_time = audio_chunks[0][0]
         last_audio_time = audio_chunks[-1][0]
         audio_duration = last_audio_time - first_audio_time
-        audio_secs = total_samples / 24000
-        stats.append(f"audio {audio_secs:.1f}s @ {total_samples/audio_duration:.0f} samples/s")
+        audio_secs = total_samples / audio_sample_rate
+        stats.append(
+            f"audio {audio_secs:.1f}s @ {total_samples / audio_duration:.0f} samples/s"
+        )
 
     stats.append(f"total {total_time:.3f}s")
     print(f"\n[{' | '.join(stats)}]")
@@ -432,12 +460,15 @@ def main():
 
                 elif cmd == "/mode":
                     if arg in ("asr", "tts", "interleaved"):
-                        if arg != mode:
+                        if arg == mode:
+                            print(f"Already in {mode} mode")
+                        elif arg == "interleaved":
                             mode = arg
                             is_first_message = True
-                            print(f"Mode: {mode}" + (" (single-shot)" if mode in ("asr", "tts") else " (chat)"))
+                            print(f"Mode: {mode} (chat)")
                         else:
-                            print(f"Already in {mode} mode")
+                            mode = arg
+                            print(f"Mode: {mode} (single-shot)")
                     else:
                         print("Usage: /mode <asr|tts|interleaved>")
                     continue
@@ -484,7 +515,9 @@ def main():
                     continue
 
             # Prepare request based on mode
-            text_input = user_input if user_input and not user_input.startswith("/") else None
+            text_input = (
+                user_input if user_input and not user_input.startswith("/") else None
+            )
 
             if mode == "asr":
                 if not wav_data:
@@ -509,7 +542,11 @@ def main():
                 if mode in ("asr", "tts"):
                     # Single-shot mode: system + one message, always reset
                     stream = create_stream_single_shot(
-                        client, mode, text=text_input, wav_data=wav_data, max_tokens=args.max_tokens
+                        client,
+                        mode,
+                        text=text_input,
+                        wav_data=wav_data,
+                        max_tokens=args.max_tokens,
                     )
                 else:
                     # Interleaved chat mode: only send new messages
@@ -517,7 +554,9 @@ def main():
 
                     # First message needs system prompt and reset
                     if is_first_message:
-                        messages.append({"role": "system", "content": SYSTEM_PROMPTS["interleaved"]})
+                        messages.append(
+                            {"role": "system", "content": SYSTEM_PROMPTS["interleaved"]}
+                        )
 
                     # Add user message(s)
                     if text_input:
@@ -526,7 +565,10 @@ def main():
                         messages.append(create_audio_message(wav_data))
 
                     stream = create_stream_chat(
-                        client, messages, max_tokens=args.max_tokens, reset_context=is_first_message
+                        client,
+                        messages,
+                        max_tokens=args.max_tokens,
+                        reset_context=is_first_message,
                     )
                     is_first_message = False
 
